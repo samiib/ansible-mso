@@ -34,6 +34,8 @@ class MSOTemplate:
             if self.template_summary:
                 self.template_path = "{0}/{1}".format(self.templates_path, self.template_id)
                 self.template = self.mso.query_obj(self.template_path)
+                self.template_name = self.template.get("displayName")
+                self.template_type = self.template.get("templateType")
             else:
                 self.mso.fail_json(
                     msg="Provided template id '{0}' does not exist. Existing templates: {1}".format(
@@ -92,6 +94,13 @@ class MSOTemplate:
             self.mso.fail_json(msg="Template '{0}' not found.".format(self.template_name))
         if self.template.get("templateType") != template_type:
             self.mso.fail_json(msg="Template type must be '{0}'.".format(template_type))
+
+    def add_template_values(self, mso_dict):
+        if self.template_id:
+            mso_dict["templateId"] = self.template_id
+        if self.template_name:
+            mso_dict["templateName"] = self.template_name
+        return mso_dict
 
     def get_object_by_key_value_pairs(self, object_description, search_list, kv_list, fail_module=False):
         """
