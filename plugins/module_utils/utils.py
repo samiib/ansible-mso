@@ -146,3 +146,20 @@ def check_if_all_elements_are_none(values):
     :return: True if all elements are None, False otherwise. -> boo
     """
     return all(value is None for value in values)
+
+
+def get_template_object_by_uuid(mso, object_type, uuid, fail_module=True):
+    """
+    Retrieve a specific object type in the MSO template using its UUID.
+    :param mso: An instance of the MSO class, which provides methods for making API requests -> MSO Class instance
+    :param object_type: The type of the object to retrieve the name for -> Str
+    :param uuid: The UUID of the object to retrieve the name for -> Str
+    :return: Str | None: The processed result which could be:
+          When the UUID is existing, returns object name -> Str
+          When the UUID is not existing -> None
+    """
+    response_object = mso.request("templates/objects?type={0}&uuid={1}".format(object_type, uuid), "GET")
+    if not response_object and fail_module:
+        msg = "Provided {0} with UUID of '{1}' not found.".format(object_type, uuid)
+        mso.fail_json(msg=msg)
+    return response_object
