@@ -435,4 +435,8 @@ class MSOTemplate:
                         config_data[object_values.get("template")] = template_object.get("templateName")
                     if object_values.get("templateId"):
                         config_data[object_values.get("templateId")] = template_object.get("templateId")
+                    if object_values.get("schemaId"):
+                        config_data[object_values.get("schemaId")] = template_object.get("schemaId")
+                    if object_values.get("schema"):
+                        config_data[object_values.get("schema")] = template_object.get("schemaName")
             return config_data
