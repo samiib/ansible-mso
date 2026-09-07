@@ -45,6 +45,57 @@ if PY3:
         return (a > b) - (a < b)
 
 
+def parse_version(version_string):
+    """Parse a version string into a list of integers for comparison.
+    
+    Examples:
+        "5.2.1.5" -> [5, 2, 1, 5]
+        "4.2" -> [4, 2]
+    """
+    if not version_string:
+        return []
+    version = []
+    for part in str(version_string).split("."):
+        match = re.search(r"(\d+)", part)
+        if match is None:
+            break
+        version.append(int(match.group(1)))
+    return version
+
+
+def version_compare(version1, version2):
+    """Compare two version lists. Returns -1, 0, or 1 (compatible with cmp).
+    
+    Args:
+        version1: First version (string or list of ints)
+        version2: Second version (string or list of ints)
+    
+    Returns:
+        -1 if version1 < version2
+         0 if version1 == version2
+         1 if version1 > version2
+    """
+    v1 = parse_version(version1) if isinstance(version1, str) else list(version1 or [])
+    v2 = parse_version(version2) if isinstance(version2, str) else list(version2 or [])
+    
+    # Pad with zeros to same length
+    max_len = max(len(v1), len(v2))
+    v1 += [0] * (max_len - len(v1))
+    v2 += [0] * (max_len - len(v2))
+    
+    if v1 < v2:
+        return -1
+    elif v1 > v2:
+        return 1
+    else:
+        return 0
+
+
+def version_greater_than_or_equal(version, min_version):
+    """Check if version >= min_version."""
+    return version_compare(version, min_version) >= 0
+
+
 def issubset(subset, superset):
     """Recurse through nested dictionary and compare entries"""
 
@@ -1254,6 +1305,25 @@ class MSOModule(object):
         remote_info = dict(id=remote.get("id"), path=remote.get("credential")["remotePath"])
         return remote_info
 
+    def get_platform_version(self, fail_on_error=False):
+        """Fetch and cache the platform version info from /platform/version endpoint.
+        
+        Returns a dict with keys: version (NDO version) and platformVersion (ND version).
+        Caches the result to avoid repeated API calls within the same module run.
+        """
+        if not hasattr(self, "_cached_platform_version"):
+            try:
+                platform_version = self.request("platform/version", method="GET")
+                if not isinstance(platform_version, dict):
+                    raise TypeError("Unexpected response type: expected dict, got {0}".format(type(platform_version).__name__))
+                self._cached_platform_version = platform_version
+            except Exception as e:
+                if fail_on_error:
+                    self.fail_json(msg="Unable to retrieve platform version from '/platform/version': {0}".format(to_native(e)))
+                self.module.warn("Unable to retrieve platform version from '/platform/version': {0}".format(to_native(e)))
+                self._cached_platform_version = {}
+        return self._cached_platform_version
+
     def lookup_users(self, users, ignore_not_found_error=False):
         """Look up users and return their ids"""
         # Ensure tenant has at least admin user
@@ -1316,6 +1386,115 @@ class MSOModule(object):
                 ):
                     return user
         return None
+
+    # --- ND 4.2+ / NDO 5.2+ user lookups (v1 infra API) ---
+    #
+    # The functions below are a fully separate implementation path for NDO 5.2+, built on the
+    # new v1 infra user endpoints (/api/v1/infra/aaa/localUsers and .../remoteUsers), which
+    # expose the rbac.tenantDomain field needed to detect the built-in, immutable
+    # "all-tenants-domain". They intentionally do not share code with the legacy lookup_users()/
+    # lookup_remote_users()/get_user_from_list_of_users() above, so that the legacy ND
+    # workarounds can eventually be dropped independently without touching this path.
+
+    def get_nd_users_v1(self, nd_users=None):
+        """Fetch ND users from the v1 infra API (ND 4.2+ / NDO 5.2+).
+
+        Args:
+            nd_users: If provided, return this instead of fetching (for reuse of pre-fetched
+                      data across lookup_users_v1/lookup_remote_users_v1/get_all_tenants_domain_user_ids).
+
+        Returns:
+            Tuple of (local_users, remote_users) dicts.
+        """
+        if nd_users is not None:
+            return nd_users
+
+        local_users = {}
+        remote_users = {}
+        if self.platform == "nd":
+            local_users = self.nd_request("/api/v1/infra/aaa/localUsers", method="GET", ignore_not_found_error=True) or {}
+            remote_users = self.nd_request("/api/v1/infra/aaa/remoteUsers", method="GET", ignore_not_found_error=True) or {}
+        return (local_users, remote_users)
+
+    def get_user_from_list_of_nd_users_v1(self, user_name, users, users_key, login_domain=None):
+        """Get a user dict from a v1 infra API users response (flat loginID/userID objects)."""
+        for user in (users or {}).get(users_key) or []:
+            if user.get("loginID") == user_name and user.get("loginDomain") == login_domain:
+                return user
+        return None
+
+    def lookup_users_v1(self, users, ignore_not_found_error=False, nd_users=None):
+        """Look up users and return their ids, using the v1 infra API (ND 4.2+ / NDO 5.2+)."""
+        if users is None:
+            users = ["admin"]
+        elif "admin" not in users:
+            users.append("admin")
+
+        ids = []
+        local_users, remote_users = self.get_nd_users_v1(nd_users=nd_users)
+
+        for user in users:
+            user_dict = self.get_user_from_list_of_nd_users_v1(user, local_users, "localusers")
+            if user_dict is None:
+                user_dict = self.get_user_from_list_of_nd_users_v1(user, remote_users, "remoteUsers")
+            if not user_dict and not ignore_not_found_error:
+                self.fail_json(msg="User '{0}' is not a valid user name.".format(user))
+            elif not user_dict and ignore_not_found_error:
+                self.module.warn("User '{0}' is not a valid user name.".format(user))
+                return ids
+            id = dict(userId=user_dict.get("userID"))
+            if id in ids:
+                self.fail_json(msg="User '{0}' is duplicate.".format(user))
+            ids.append(id)
+        return ids
+
+    def lookup_remote_users_v1(self, remote_users, ignore_not_found_error=False, nd_users=None):
+        """Look up remote users and return their ids, using the v1 infra API (ND 4.2+ / NDO 5.2+)."""
+        ids = []
+        _, remote_users_data = self.get_nd_users_v1(nd_users=nd_users)
+
+        for remote_user in remote_users:
+            user_dict = self.get_user_from_list_of_nd_users_v1(
+                remote_user.get("name"), remote_users_data, "remoteUsers", login_domain=remote_user.get("login_domain")
+            )
+            if not user_dict and not ignore_not_found_error:
+                self.fail_json(msg="User '{0}' is not a valid user name.".format(remote_user.get("name")))
+            elif not user_dict and ignore_not_found_error:
+                self.module.warn("User '{0}' is not a valid user name.".format(remote_user.get("name")))
+                return ids
+            id = dict(userId=user_dict.get("userID"))
+            if id in ids:
+                self.fail_json(msg="User '{0}' is duplicate.".format(remote_user.get("name")))
+            ids.append(id)
+        return ids
+
+    def get_all_tenants_domain_user_ids(self, nd_users=None):
+        """Return the ids of users that belong to the built-in ND 'all-tenants-domain'.
+
+        On ND 4.2+ / NDO 5.2+, users in this domain are automatically and permanently
+        associated with every tenant and cannot be removed from a tenant's userAssociations.
+        Callers building a userAssociations payload must always include these ids to avoid
+        the API rejecting an implied removal of an immutable user.
+
+        Args:
+            nd_users: Optional pre-fetched (local_users, remote_users) tuple (see get_nd_users_v1()).
+
+        Returns:
+            List of user dicts with userId field for all-tenants-domain members.
+        """
+        ids = []
+        if self.platform != "nd":
+            return ids
+
+        local_users, remote_users = self.get_nd_users_v1(nd_users=nd_users)
+
+        for user in (local_users or {}).get("localusers") or []:
+            if user.get("rbac", {}).get("tenantDomain") == "all-tenants-domain" and user.get("userID"):
+                ids.append(dict(userId=user.get("userID")))
+        for user in (remote_users or {}).get("remoteUsers") or []:
+            if user.get("rbac", {}).get("tenantDomain") == "all-tenants-domain" and user.get("userID"):
+                ids.append(dict(userId=user.get("userID")))
+        return ids
 
     def lookup_remote_users(self, remote_users, ignore_not_found_error=False):
         ids = []

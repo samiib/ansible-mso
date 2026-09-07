@@ -38,7 +38,10 @@ options:
     description:
     - A list of associated users for this tenant.
     - Using this property will replace any existing associated users.
-    - Admin user is always added to the associated user list irrespective of this parameter being used.
+    - Admin user, and any user belonging to the built-in ND 'all-tenants-domain' (ND 4.2+ /
+      NDO 5.2+ and later), are always added to the associated user list irrespective of this
+      parameter being used, since these users are automatically and permanently associated
+      with every tenant and cannot be removed.
     type: list
     elements: str
   remote_users:
@@ -131,7 +134,7 @@ RETURN = r"""
 """
 
 from ansible.module_utils.basic import AnsibleModule
-from ansible_collections.cisco.mso.plugins.module_utils.mso import MSOModule, mso_argument_spec, ndo_remote_user_spec
+from ansible_collections.cisco.mso.plugins.module_utils.mso import MSOModule, mso_argument_spec, ndo_remote_user_spec, version_greater_than_or_equal
 from ansible_collections.cisco.mso.plugins.module_utils.constants import YES_OR_NO_TO_BOOL_STRING_MAP
 
 
@@ -196,9 +199,34 @@ def main():
 
         # Convert sites and users
         sites = mso.lookup_sites(module.params.get("sites"))
-        users = mso.lookup_users(module.params.get("users"))
-        if remote_users is not None:
-            users += mso.lookup_remote_users(remote_users)
+        
+        # ND 4.2+ / NDO 5.2+ exposes a new v1 infra user API that also reports which users
+        # belong to the built-in, immutable "all-tenants-domain" (see rbac.tenantDomain). On
+        # these versions, use that API exclusively for user lookups (lookup_users_v1 /
+        # lookup_remote_users_v1) and merge in the all-tenants-domain users so the tenant's
+        # userAssociations "replace" semantics never implicitly try to remove them. Older ND
+        # versions are unaffected and keep using the legacy lookup_users()/lookup_remote_users().
+        platform_version = mso.get_platform_version(fail_on_error=mso.platform == "nd")
+        ndo_version = platform_version.get("version", "")
+        is_ndo_5_2_or_later = version_greater_than_or_equal(ndo_version, "5.2")
+
+        if is_ndo_5_2_or_later:
+            nd_users_v1 = mso.get_nd_users_v1()
+            users = mso.lookup_users_v1(module.params.get("users"), nd_users=nd_users_v1)
+            if remote_users is not None:
+                users += mso.lookup_remote_users_v1(remote_users, nd_users=nd_users_v1)
+
+            immutable_users = mso.get_all_tenants_domain_user_ids(nd_users=nd_users_v1)
+            if mso.existing:
+                existing_user_ids = set(user.get("userId") for user in (mso.existing.get("userAssociations") or []) if user.get("userId"))
+                immutable_users = [user for user in immutable_users if user.get("userId") in existing_user_ids]
+            for immutable_user in immutable_users:
+                if immutable_user not in users:
+                    users.append(immutable_user)
+        else:
+            users = mso.lookup_users(module.params.get("users"))
+            if remote_users is not None:
+                users += mso.lookup_remote_users(remote_users)
 
         payload = dict(
             description=description,
@@ -220,12 +248,25 @@ def main():
                 if module.check_mode:
                     mso.existing = mso.proposed
                 else:
-                    mso.existing = mso.request(path, method="PUT", data=mso.sent)
+                    # NDO 5.2+ tenant PUT/POST response doesn't always echo back the full,
+                    # up-to-date userAssociations (e.g. all-tenants-domain merges above), so
+                    # re-query the tenant to get the accurate result. Older NDO versions keep
+                    # using the write response directly, unchanged.
+                    if is_ndo_5_2_or_later:
+                        mso.request(path, method="PUT", data=mso.sent)
+                        mso.existing = mso.request(path, method="GET")
+                    else:
+                        mso.existing = mso.request(path, method="PUT", data=mso.sent)
         else:
             if module.check_mode:
                 mso.existing = mso.proposed
             else:
-                mso.existing = mso.request(path, method="POST", data=mso.sent)
+                created_obj = mso.request(path, method="POST", data=mso.sent)
+                if is_ndo_5_2_or_later:
+                    created_id = created_obj.get("id") if isinstance(created_obj, dict) else None
+                    mso.existing = mso.request("tenants/{id}".format(id=created_id), method="GET") if created_id else created_obj
+                else:
+                    mso.existing = created_obj
 
     mso.exit_json()
 
